@@ -19,13 +19,14 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Optional, TypedDict, Literal, cast
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -33,6 +34,35 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 os.environ.setdefault("USER_AGENT", "AkadVerseBot/1.0")
+
+
+def _log_event(level: int, event: str, **fields: Any) -> None:
+    payload = {"event": event, **fields}
+    try:
+        logger.log(level, json.dumps(payload, ensure_ascii=True, default=str))
+    except Exception:
+        logger.log(level, "%s %s", event, fields)
+
+
+def _extract_langchain_token_usage(response: Any) -> dict[str, Any]:
+    metadata = getattr(response, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return {}
+
+    usage = metadata.get("token_usage") or metadata.get("usage_metadata") or {}
+    if not isinstance(usage, dict):
+        return {}
+
+    return {
+        "prompt_tokens": usage.get("prompt_tokens") or usage.get("input_tokens"),
+        "candidate_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+    }
+
+
+def _absolute_download_url(base_url: str, filename: str) -> str:
+    base = str(base_url).rstrip("/") + "/"
+    return f"{base}slides/download/{filename}"
 
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
 THEME_CLASSIFIER_CONFIDENCE_THRESHOLD = float(os.getenv("THEME_CLASSIFIER_CONFIDENCE_THRESHOLD", "0.60"))
@@ -99,7 +129,7 @@ def _is_text_model(model_name: str) -> bool:
 def discover_gemini_model(api_key: str) -> str:
     """Discover the best available Gemini model dynamically."""
     if not api_key or genai is None:
-        return "gemini-1.5-flash"
+        return "gemini-2.0-flash-lite"
 
     try:
         client = genai.Client(api_key=api_key)
@@ -117,7 +147,7 @@ def discover_gemini_model(api_key: str) -> str:
         priority_order = [
             "gemini-2.5-flash",
             "gemini-2.0-flash",
-            "gemini-1.5-flash",
+            "gemini-2.0-flash-lite",
             "gemini-2.5-pro",
             "gemini-pro",
         ]
@@ -131,7 +161,7 @@ def discover_gemini_model(api_key: str) -> str:
     except Exception as e:
         logger.warning("Gemini model discovery failed, falling back to default: %s", e)
 
-    return "gemini-1.5-flash"
+    return "gemini-2.0-flash-lite"
 
 
 def initialize_llm() -> None:
@@ -355,7 +385,7 @@ def _extract_text_with_tesseract(image_path: str) -> tuple[str, dict[str, float 
     return cleaned_text, _score_ocr_output(cleaned_text, confidences)
 
 
-def _extract_text_with_gemini_vision(image_path: str) -> str:
+def _extract_text_with_gemini_vision(image_path: str, request_id: str | None = None) -> str:
     if not GEMINI_VISION_AVAILABLE or genai is None or types is None:
         raise RuntimeError("Gemini Vision is not available in this environment")
 
@@ -384,13 +414,39 @@ def _extract_text_with_gemini_vision(image_path: str) -> str:
         "the extracted text without commentary."
     )
 
-    response = client.models.generate_content(
-        model=LLM_MODEL if LLM_AVAILABLE and LLM_MODEL.startswith("gemini") else "gemini-2.5-flash",
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-            prompt,
-        ],
-    )
+    model_name = LLM_MODEL if LLM_AVAILABLE and LLM_MODEL.startswith("gemini") else "gemini-2.5-flash"
+    started = time.perf_counter()
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                prompt,
+            ],
+        )
+        _log_event(
+            logging.INFO,
+            "slide.vision.gemini",
+            request_id=request_id,
+            model_name=model_name,
+            mime_type=mime_type,
+            image_bytes=len(image_bytes),
+            latency_ms=round((time.perf_counter() - started) * 1000, 2),
+            status="ok",
+        )
+    except Exception as exc:
+        _log_event(
+            logging.WARNING,
+            "slide.vision.gemini",
+            request_id=request_id,
+            model_name=model_name,
+            mime_type=mime_type,
+            image_bytes=len(image_bytes),
+            latency_ms=round((time.perf_counter() - started) * 1000, 2),
+            status="error",
+            error_type=type(exc).__name__,
+        )
+        raise
 
     vision_text = _normalize_extracted_text(response.text or "")
     if not vision_text:
@@ -674,7 +730,11 @@ def _normalize_domain_name(label: str) -> str:
     return aliases.get(normalized, "general_academic")
 
 
-async def _classify_domain_with_gemini(subject: str, content: str) -> tuple[Optional[str], float]:
+async def _classify_domain_with_gemini(
+    subject: str,
+    content: str,
+    request_id: str | None = None,
+) -> tuple[Optional[str], float]:
     if llm is None or not LLM_AVAILABLE:
         return (None, 0.0)
 
@@ -690,22 +750,63 @@ async def _classify_domain_with_gemini(subject: str, content: str) -> tuple[Opti
         f"Content Preview: {preview}"
     )
 
+    started = time.perf_counter()
     try:
         response = await llm.ainvoke(prompt)
         payload = _extract_json_payload(str(getattr(response, "content", "")))
         if not payload:
+            _log_event(
+                logging.INFO,
+                "slide.theme_classifier.gemini",
+                request_id=request_id,
+                model_name=LLM_MODEL,
+                prompt_len=len(prompt),
+                latency_ms=round((time.perf_counter() - started) * 1000, 2),
+                status="ok",
+                domain_result=None,
+                confidence=0.0,
+                parse_json_success=False,
+                **_extract_langchain_token_usage(response),
+            )
             return (None, 0.0)
 
         domain = _normalize_domain_name(str(payload.get("domain", "")))
         confidence = _to_float(payload.get("confidence", 0.0), 0.0)
         confidence = max(0.0, min(1.0, confidence))
+        _log_event(
+            logging.INFO,
+            "slide.theme_classifier.gemini",
+            request_id=request_id,
+            model_name=LLM_MODEL,
+            prompt_len=len(prompt),
+            latency_ms=round((time.perf_counter() - started) * 1000, 2),
+            status="ok",
+            domain_result=domain,
+            confidence=confidence,
+            parse_json_success=True,
+            **_extract_langchain_token_usage(response),
+        )
         return (domain, confidence)
     except Exception as e:
+        _log_event(
+            logging.WARNING,
+            "slide.theme_classifier.gemini",
+            request_id=request_id,
+            model_name=LLM_MODEL,
+            prompt_len=len(prompt),
+            latency_ms=round((time.perf_counter() - started) * 1000, 2),
+            status="error",
+            error_type=type(e).__name__,
+        )
         logger.warning("Gemini theme classifier failed, falling back to keyword classifier: %s", e)
         return (None, 0.0)
 
 
-async def resolve_theme_selection(subject: str, content: str) -> ThemeSelection:
+async def resolve_theme_selection(
+    subject: str,
+    content: str,
+    request_id: str | None = None,
+) -> ThemeSelection:
     cache_key = _build_theme_classifier_cache_key(subject, content)
     cached = _THEME_CLASSIFIER_CACHE.get(cache_key)
     now = datetime.now().timestamp()
@@ -723,7 +824,7 @@ async def resolve_theme_selection(subject: str, content: str) -> ThemeSelection:
     selected_domain: str
     selected_confidence: float
 
-    domain, confidence = await _classify_domain_with_gemini(subject, content)
+    domain, confidence = await _classify_domain_with_gemini(subject, content, request_id=request_id)
     if domain and confidence >= THEME_CLASSIFIER_CONFIDENCE_THRESHOLD:
         source = "gemini_classifier"
         selected_domain = domain
@@ -887,8 +988,12 @@ def get_slide_count(content: str) -> int:
 # SLIDE STRUCTURE GENERATOR
 # ─────────────────────────────────────────────
 
-async def generate_slide_structure(content: str, subject: str = "",
-                                   num_slides: Optional[int] = None) -> dict:
+async def generate_slide_structure(
+    content: str,
+    subject: str = "",
+    num_slides: Optional[int] = None,
+    request_id: str | None = None,
+) -> dict:
     """Use LLM to generate a structured slide outline from content."""
 
     if not num_slides:
@@ -968,6 +1073,7 @@ async def generate_slide_structure(content: str, subject: str = "",
             ]
         }
 
+    started = time.perf_counter()
     try:
         response = await llm.ainvoke(prompt)
         raw = str(getattr(response, "content", "")).strip()
@@ -978,16 +1084,57 @@ async def generate_slide_structure(content: str, subject: str = "",
 
         try:
             structure = json.loads(raw)
-            return _normalize_structure(structure)
+            normalized = _normalize_structure(structure)
+            _log_event(
+                logging.INFO,
+                "slide.structure.gemini",
+                request_id=request_id,
+                model_name=LLM_MODEL,
+                prompt_len=len(prompt),
+                content_truncated_len=len(content_truncated),
+                parse_json_success=True,
+                slides_generated_count=len(normalized.get("slides", [])),
+                latency_ms=round((time.perf_counter() - started) * 1000, 2),
+                status="ok",
+                **_extract_langchain_token_usage(response),
+            )
+            return normalized
         except json.JSONDecodeError:
             # Try to extract JSON from response
             match = re.search(r'\{.*\}', raw, re.DOTALL)
             if match:
                 try:
-                    return _normalize_structure(json.loads(match.group(0)))
+                    normalized = _normalize_structure(json.loads(match.group(0)))
+                    _log_event(
+                        logging.INFO,
+                        "slide.structure.gemini",
+                        request_id=request_id,
+                        model_name=LLM_MODEL,
+                        prompt_len=len(prompt),
+                        content_truncated_len=len(content_truncated),
+                        parse_json_success=True,
+                        slides_generated_count=len(normalized.get("slides", [])),
+                        latency_ms=round((time.perf_counter() - started) * 1000, 2),
+                        status="ok",
+                        **_extract_langchain_token_usage(response),
+                    )
+                    return normalized
                 except Exception:
                     pass
     except Exception as e:
+        _log_event(
+            logging.WARNING,
+            "slide.structure.gemini",
+            request_id=request_id,
+            model_name=LLM_MODEL,
+            prompt_len=len(prompt),
+            content_truncated_len=len(content_truncated),
+            parse_json_success=False,
+            slides_generated_count=0,
+            latency_ms=round((time.perf_counter() - started) * 1000, 2),
+            status="error",
+            error_type=type(e).__name__,
+        )
         logger.warning("Gemini slide generation failed, using fallback structure: %s", e)
 
     return _normalize_structure({
@@ -1181,16 +1328,28 @@ OUTPUT_DIR = "generated_slides"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-async def process_and_build(content: str, subject: str, num_slides: Optional[int],
-                             filename_base: str) -> dict:
+async def process_and_build(
+    content: str,
+    subject: str,
+    num_slides: Optional[int],
+    filename_base: str,
+    base_url: str,
+    request_id: str | None = None,
+) -> dict:
     """Core pipeline: content → LLM structure → PPTX file."""
     if not content.strip():
         raise HTTPException(status_code=400, detail="No usable content was provided")
 
     try:
         # Keep normalization centralized so every endpoint gets consistent structure quality.
-        structure = _normalize_structure(await generate_slide_structure(content, subject, num_slides))
-        theme_selection = await resolve_theme_selection(subject or str(structure.get("title", "")), content)
+        structure = _normalize_structure(
+            await generate_slide_structure(content, subject, num_slides, request_id=request_id)
+        )
+        theme_selection = await resolve_theme_selection(
+            subject or str(structure.get("title", "")),
+            content,
+            request_id=request_id,
+        )
         theme = theme_selection["theme"]
 
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -1205,7 +1364,7 @@ async def process_and_build(content: str, subject: str, num_slides: Optional[int
             "title": structure.get("title"),
             "total_slides": len(structure.get("slides", [])) + 1,  # +1 for title slide
             "filename": os.path.basename(built_path),
-            "download_url": f"/slides/download/{os.path.basename(built_path)}",
+            "download_url": _absolute_download_url(base_url, os.path.basename(built_path)),
             "structure_preview": structure.get("slides", [])[:3],
             "llm_model": LLM_MODEL,
             "theme_name": theme["name"],
@@ -1227,21 +1386,40 @@ async def process_and_build(content: str, subject: str, num_slides: Optional[int
 
 @app.post("/slides/from-text")
 async def slides_from_text(
+    request: Request,
     content: str = Form(...),
     subject: str = Form(""),
     num_slides: int = Form(0),
     user_id: str = Form("")
 ):
     """Generate slides from plain text."""
+    request_id = uuid.uuid4().hex
+    _log_event(
+        logging.INFO,
+        "slide.request.start",
+        request_id=request_id,
+        subject_len=len(subject),
+        content_len=len(content),
+        num_slides_requested=num_slides,
+        user_id_present=bool(user_id),
+    )
     if not content.strip():
         raise HTTPException(status_code=400, detail="Content cannot be empty")
     if num_slides < 0:
         raise HTTPException(status_code=400, detail="num_slides cannot be negative")
-    return await process_and_build(content, subject, num_slides or None, "presentation")
+    return await process_and_build(
+        content,
+        subject,
+        num_slides or None,
+        "presentation",
+        str(request.base_url),
+        request_id=request_id,
+    )
 
 
 @app.post("/slides/from-url")
 async def slides_from_url(
+    request: Request,
     url: str = Form(...),
     subject: str = Form(""),
     num_slides: int = Form(0),
@@ -1259,11 +1437,12 @@ async def slides_from_url(
 
     if not content.strip():
         raise HTTPException(status_code=400, detail="Could not extract content from URL")
-    return await process_and_build(content, subject, num_slides or None, "web_content")
+    return await process_and_build(content, subject, num_slides or None, "web_content", str(request.base_url))
 
 
 @app.post("/slides/from-document")
 async def slides_from_document(
+    request: Request,
     file: UploadFile = File(...),
     subject: str = Form(""),
     num_slides: int = Form(0),
@@ -1310,11 +1489,12 @@ async def slides_from_document(
     resolved_subject = subject or original_filename
 
     return await process_and_build(content, resolved_subject,
-                                   num_slides or None, filename_stem)
+                                   num_slides or None, filename_stem, str(request.base_url))
 
 
 @app.post("/slides/from-image")
 async def slides_from_image(
+    request: Request,
     image: UploadFile = File(...),
     subject: str = Form(""),
     num_slides: int = Form(0),
@@ -1356,7 +1536,7 @@ async def slides_from_image(
     if not content.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from image")
 
-    result = await process_and_build(content, subject, num_slides or None, "image_notes")
+    result = await process_and_build(content, subject, num_slides or None, "image_notes", str(request.base_url))
     result["extraction_source"] = extraction_source
     result["extraction_quality"] = extraction_quality
     return result
