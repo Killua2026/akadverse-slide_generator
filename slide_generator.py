@@ -129,7 +129,7 @@ def _is_text_model(model_name: str) -> bool:
 def discover_gemini_model(api_key: str) -> str:
     """Discover the best available Gemini model dynamically."""
     if not api_key or genai is None:
-        return "gemini-2.0-flash-lite"
+        return "gemini-2.5-flash"
 
     try:
         client = genai.Client(api_key=api_key)
@@ -145,12 +145,18 @@ def discover_gemini_model(api_key: str) -> str:
                 discovered_models.append(normalized_name)
 
         priority_order = [
+            # Primary fast workhorses (latest stable Flash)
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.5-flash",
+            # Budget / high-throughput fallback
+            "gemini-3.5-flash-lite",
+            # Stable prior-generation workhorse
             "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
+            # High-reasoning fallback tiers
+            "gemini-3.1-pro-preview",
             "gemini-2.5-pro",
-            "gemini-pro",
-        ]
+            ]
 
         for preferred_model in priority_order:
             if preferred_model in discovered_models:
@@ -161,7 +167,7 @@ def discover_gemini_model(api_key: str) -> str:
     except Exception as e:
         logger.warning("Gemini model discovery failed, falling back to default: %s", e)
 
-    return "gemini-2.0-flash-lite"
+    return "gemini-2.5-flash"
 
 
 def initialize_llm() -> None:
